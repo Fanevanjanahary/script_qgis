@@ -2,32 +2,39 @@
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
+                       QgsCoordinateReferenceSystem,
                        QgsFeatureSink,
                        QgsProcessingException,
                        QgsProcessingAlgorithm,
-                       QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterRasterLayer,
-                       QgsProcessingParameterFeatureSink,
+                       QgsProcessingParameterFolderDestination,
+                       QgsProcessingParameterNumber,
                        QgsProcessingParameterCrs)
 import processing
 
 class SliptRasterProcessing(QgsProcessingAlgorithm):
     
-    INPUT = 'Image png'
-    CRS = 'Crs'
-    OUTPUT = 'Sortie'
-    
+    INPUT = 'INPUT'
+    DIMENSIONS = 'DIMENSIONS'
+    CRS = 'CRS'
+    OUTPUT = 'OUTPUT'
+   
+   
     def createInstance(self):
         return SliptRasterProcessing()
     
+    
     def name(self):
-        return 'split_raster'
+        return 'splitraster'
+    
     
     def displayName(self):
         return 'Découpage Raster'
     
+    
     def group(self):
         return 'Scripts de FuturMap'
+    
     
     def initAlgorithm(self, config=None):
         """
@@ -40,26 +47,38 @@ class SliptRasterProcessing(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterRasterLayer(self.INPUT,
                                                             'Raster'
                                                                ))
-
-        # We add a feature sink in which to store our processed features (this
-        # usually takes the form of a newly created vector layer when the
-        # algorithm is run in QGIS).
+        
         self.addParameter(
-            QgsProcessingParameterFeatureSink(
-                self.OUTPUT,
-                'Sortie'
+            QgsProcessingParameterNumber(
+            self.DIMENSIONS, 
+            'Dimension', 
+            type = QgsProcessingParameterNumber.Double,
+            defaultValue = 25.00,
+            minValue = 25.00,
+            maxValue = 100.00
             )
         )
         
         self.addParameter(
             QgsProcessingParameterCrs(
             self.CRS, 'Projection', 
-            optional=True)
+            )
         )
+        
+        # We add a feature sink in which to store our processed features (this
+        # usually takes the form of a newly created vector layer when the
+        # algorithm is run in QGIS).
+        self.addParameter(
+            QgsProcessingParameterFolderDestination(
+                self.OUTPUT,
+                'Sortie'
+            )
+        )
+    
     
     def processAlgorithm(self, parameters, context, feedback):
         
-        rester = self.parameterAsRasterLayer(
+        raster = self.parameterAsRasterLayer(
             parameters,
             self.INPUT,
             context
@@ -76,30 +95,63 @@ class SliptRasterProcessing(QgsProcessingAlgorithm):
             self.CRS, 
             context
         )
+
+        folder = self.parameterAsFile(
+            parameters, 
+            self.OUTPUT, 
+            context
+        )
         
-        ext = raster.extent()
-        xmin = ext.xMinimum()
-        xmax = ext.xMaximum()
-        ymin = ext.yMinimum()
-        ymax = ext.yMaximum()
-        coords = '{},{},{},{}'.format(xmin,xmax,ymin,ymax)
+        dim = self.parameterAsDouble(
+            parameters, 
+            self.DIMENSIONS, 
+            context
+        )
         
-        for band in range(1, layer.bandCount() + 1):
-            stats = provider.bandStatistics(band, QgsRasterBandStats.All, ext, 0)
-            min = stats.minimumValue
-            max = stats.maximumValue
-            provider.setNoDataValue(band,max)
-            layer.triggerRepaint()
+        raster.setCrs(crs)
         
-        grid = processing.run("qgis:creategrid", param={
-                'TYPE':2,
-                'EXTENT':coords,
-                'HSPACING':200,
-                'VSPACING':200,
-                'HOVERLAY':0,
-                'VOVERLAY':0,
-                'CRS':'EPSG:3946',
-                'OUTPUT':'memory:'
-                })
+        feedback.pushInfo('Création de la grille')
+        result = processing.run("qgis:creategrid", {
+                        'TYPE':2,
+                        'EXTENT': raster,
+                        'HSPACING':dim,
+                        'VSPACING':dim,
+                        'HOVERLAY':0,
+                        'VOVERLAY':0,
+                        'CRS':crs.authid(),
+                        'OUTPUT':'memory:'
+                        },context=context, feedback=feedback)
 
 
+        feedback.pushInfo('Calcul des stats zonales')
+        processing.run("qgis:zonalstatistics", {
+                        'INPUT_RASTER':raster,
+                        'RASTER_BAND':1,
+                        'INPUT_VECTOR':result['OUTPUT'],
+                        'COLUMN_PREFIX':'_',
+                        'STATS':[0]
+                        },context=context, feedback=feedback)
+        
+        feedback.pushInfo('Extraction des cellules intersectant le raster')
+        result = processing.run("native:extractbyexpression", {
+                    'INPUT':result['OUTPUT'],
+                    'EXPRESSION':'\"_count\" > 0',
+                    'OUTPUT':'memory:'
+                    },context=context, feedback=feedback)
+
+        #grid = QgsProject.instance().layerStore().mapLayer(result['OUTPUT'])
+        grid = result['OUTPUT']
+        #print(result)
+
+        feedback.pushInfo('Découpage')
+        for i, item in enumerate(grid.getFeatures()):
+            processing.runAndLoadResults("gdal:cliprasterbyextent", {
+                        'INPUT':raster,
+                        'PROJWIN':item.geometry().boundingBox(),
+                        'NODATA':None,
+                        'OPTIONS':'',
+                        'DATA_TYPE':0,
+                        'OUTPUT':'{}/{}_{}.tif'.format(folder, raster.name(), i)
+                        },context=context)
+        output = { self.OUTPUT:folder}
+        return output
